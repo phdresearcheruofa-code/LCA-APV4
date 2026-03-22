@@ -1,0 +1,24 @@
+from __future__ import annotations
+
+import streamlit as st
+from lca_app.config import AppConfig
+
+st.set_page_config(page_title="Settings", layout="wide")
+cfg = AppConfig.from_env()
+
+st.title("⚙️ Settings")
+
+st.write("Environment variables:")
+
+st.code(
+    f"""LCA_DATABASE_URL={cfg.database_url}
+LCA_CACHE_DIR={cfg.cache_dir}
+""",
+    language="bash",
+)
+
+st.info(
+    "To connect an external/managed database later, switch the DB layer to SQLAlchemy and point to Postgres/MySQL. "
+    "This starter keeps SQLite for maximum portability.",
+    icon="🧱",
+)

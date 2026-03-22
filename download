@@ -1,0 +1,112 @@
+from __future__ import annotations
+
+import pandas as pd
+import streamlit as st
+import yaml
+
+from lca_app.config import AppConfig
+from lca_app.db import get_conn, q
+from lca_app.engine import RunOptions, solve_lci, solve_lcia
+
+st.set_page_config(page_title="Run LCA", layout="wide")
+cfg = AppConfig.from_env()
+conn = get_conn(cfg.database_url)
+
+st.title("🧮 Run LCA (process-based)")
+
+flows = q(conn, "SELECT * FROM flows WHERE flow_type='product' ORDER BY name")
+flow_map = {f"{r['name']} ({r['unit']}) [{r['id']}]": r["id"] for r in flows}
+
+methods = q(conn, "SELECT * FROM lcia_methods ORDER BY status DESC, name")
+method_map = {f"{m['name']} [{m['id']}] ({m['status']})": m["id"] for m in methods}
+
+c1, c2, c3, c4 = st.columns(4)
+with c1:
+    fu_label = st.selectbox("Functional unit (must be reference product of selected system)", list(flow_map.keys()))
+    fu_amount = st.number_input("FU amount", value=1000.0, help="In the unit shown for the selected flow.")
+with c2:
+    scenario = st.selectbox("Scenario", ["attributional", "consequential"])
+with c3:
+    stages = st.multiselect("Stages in boundary", ["production", "use", "eol"], default=["production"])
+with c4:
+    allocation_mode = st.selectbox("Co-product handling (allocation)", ["none", "manual", "mass", "economic"])
+    allocation_factor = st.number_input("Manual allocation factor", value=1.0, min_value=0.0, max_value=1.0)
+
+st.write("### Optional parameters (for amount_expr exchanges)")
+params_text = st.text_area(
+    "Parameters (YAML dict)",
+    value="electricity_kwh: 0.2\nng_mj: 20\n",
+    height=100,
+)
+
+try:
+    params = yaml.safe_load(params_text) or {}
+    if not isinstance(params, dict):
+        raise ValueError("Parameters must be a dict.")
+    params = {str(k): float(v) for k, v in params.items()}
+except Exception as e:
+    st.error(f"Invalid parameters YAML: {e}")
+    st.stop()
+
+st.write("### Optional substitution (system expansion)")
+st.caption("Map co-product product-flow IDs to substitute process IDs (advanced). Leave empty to skip.")
+sub_map_text = st.text_area("Substitution map (YAML dict)", value="{}", height=80)
+try:
+    substitution_map = yaml.safe_load(sub_map_text) or {}
+    if not isinstance(substitution_map, dict):
+        raise ValueError("Substitution map must be a dict.")
+    substitution_map = {str(k): str(v) for k, v in substitution_map.items()}
+except Exception as e:
+    st.error(f"Invalid substitution YAML: {e}")
+    st.stop()
+
+selected_methods = st.multiselect(
+    "LCIA methods",
+    list(method_map.keys()),
+    default=[k for k in method_map if "IPCC" in k][:1],
+)
+
+if st.button("Run"):
+    opts = RunOptions(
+        scenario=scenario,
+        stages=tuple(stages),
+        allocation_mode=allocation_mode,
+        allocation_factor=float(allocation_factor),
+        substitution_map=substitution_map,
+        parameters=params,
+    )
+
+    with st.spinner("Solving LCI..."):
+        lci = solve_lci(
+            conn,
+            functional_unit_flow_id=flow_map[fu_label],
+            functional_unit_amount=float(fu_amount),
+            options=opts,
+        )
+
+    st.success("LCI solved.")
+    st.write("#### Activity levels")
+    st.dataframe(
+        pd.DataFrame(
+            [{"process_id": k, "activity": v} for k, v in sorted(lci.activity_by_process.items(), key=lambda x: -abs(x[1]))]
+        ),
+        use_container_width=True,
+        height=260,
+    )
+
+    st.write("#### Inventory (elementary flows)")
+    inv_df = pd.DataFrame(
+        [{"flow_id": k, "amount": v} for k, v in sorted(lci.inventory_by_flow.items(), key=lambda x: -abs(x[1]))]
+    )
+    st.dataframe(inv_df, use_container_width=True, height=260)
+
+    for ml in selected_methods:
+        mid = method_map[ml]
+        try:
+            with st.spinner(f"Characterizing: {ml}"):
+                res = solve_lcia(conn, lci, mid)
+            df = pd.DataFrame([{"category": c.category_name, "unit": c.unit, "value": c.value} for c in res.categories])
+            st.subheader(f"LCIA — {res.method_name}")
+            st.dataframe(df, use_container_width=True, height=360)
+        except Exception as e:
+            st.error(f"LCIA failed for {ml}: {e}")
